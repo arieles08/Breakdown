@@ -1,0 +1,276 @@
+---
+title: "Trabajo Práctico Breakdown con RandonForest en Dataset Properaty"
+author: "Renso Gil y Leandro Morinigo"
+date: "04/12/2022"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    df_print: paged
+    theme: united
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+### Carga de librerías y datasets
+
+#### Librerías a utiliza
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+
+```
+
+Se cargan las librerías necesarias para el trabajo práctico.
+#### Librerias
+
+```{r}
+
+library(tidyverse)
+library(tidymodels)
+library(rsample)
+library(ggplot2)
+library(GGally)
+
+#Libreria Random Forest
+library(randomForest)
+
+# Librerías BreakDown
+library(DALEX)
+library(iBreakDown)
+```
+
+### Cargar archivo
+
+Se utiliza el dataset ya prosedado en la catedra de EEA : https://github.com/eea-uba/EEA-2022
+
+```{r}
+datos_properati <- read.csv("properati_preprocesado_2022.csv")
+# creamos nueva variable de superficie descubierta
+
+datos_properati = datos_properati %>%
+  mutate(surface_uncovered = surface_total - surface_covered)
+
+glimpse(datos_properati)
+
+```
+
+### Correlación entre variables
+
+```{r}
+# graficamos con ggpairs coloreando por property type
+g <- ggpairs(datos_properati %>% select(-c(id,l3)), aes(color = property_type), 
+          upper = list(continuous = wrap("cor", size = 3, hjust=0.5)), legend = 25, progress=FALSE) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom") + 
+  theme_bw()
+# hacemos un loop para cambiar los colores del gráfico
+for(i in 1:g$nrow) {
+  for(j in 1:g$ncol){
+    g[i,j] <- g[i,j] + 
+      scale_fill_brewer(palette="Dark2") +  
+      scale_color_brewer(palette="Dark2")
+        }
+}
+g 
+```
+```
+### Particionar el dataset en entrenamiento y test
+
+```{r}
+# fijamos semilla
+set.seed(22)
+# Partición Train y Test, indicando proporción
+train_test <- initial_split(datos_properati, prop = 0.75)
+train_data <- training(train_test)
+test_data <- testing(train_test)
+# vemos las dimensiones de cada partición
+train_data %>%
+  dim_desc() 
+```
+
+
+### Modelo de regresión multiple
+
+Se tomo como referencia El modelo de regresión lineal multiple de properati de la catedra: https://github.com/eea-uba/EEA-2022
+
+$E(precio)=\beta_0+\beta_1surface\_covered+\beta_2surface\_uncovered+\beta_3rooms+\beta_4bathrooms+\beta_5property_type+\beta_6l3$
+
+```{r}
+# Modelo multiple
+# Modelo varias + barrios
+modelo_varias <- lm(price ~ surface_covered + surface_uncovered + rooms + bathrooms + property_type + l3, data = train_data)
+tidy_varias <- tidy(modelo_varias, conf.int = TRUE)
+tidy_varias
+```
+
+
+#### Test F : evaluar significatividad global
+
+Hipótesis:
+
+-   $H_0: β_1 = β_2 = · · · = β_{p−1} = 0$
+
+-   $H_1:$ no todos los $β_k$ ($k = 1, 2,..., p−1$) son iguales a 0.
+
+```{r}
+glance(modelo_varias)
+```
+
+```{r}
+summary(modelo_varias)
+```
+
+#### Significatividad individual
+
+Test para las $\beta_k$ Se pretende probar si el coeficiente de regresón
+de la variable es distinto de cero.
+
+Hipótesis:
+
+-   $H_0:\beta_k = 0$
+-   $H_1:\beta_k ≠ 0$
+
+```{r}
+options("scipen"=1)
+tidy_varias %>%
+  select(term, statistic, p.value, conf.low, conf.high)
+```
+
+Se grafica los coeficientes estimados y sus intervalos de confianza.
+
+```{r}
+# Gráfico de los Coeficientes
+ggplot(tidy_varias, aes(estimate, term, color=p.value < 0.05, xmin = conf.low, xmax = conf.high, height = 0)) +
+  geom_point() +
+  geom_vline(xintercept = 0, lty = 4, color = "black") +
+  geom_errorbarh() +
+  scale_color_manual(values=c('firebrick', 'forestgreen')) +
+  guides(color="none") +
+  theme_bw() +
+  labs(y = "Coeficientes β", x = "Estimación")
+```
+
+
+### Evaluación del modelo
+
+```{r}
+# Agregamos la predicciones al dataset de testeo
+pred_varias = augment(modelo_varias, newdata = test_data) 
+pred_varias %>% select(l3,rooms, surface_covered, surface_uncovered, property_type, .fitted, .resid)
+```
+
+```{r}
+# Listado de modelos
+modelos_lineales = list(modelo_lineal_basico = modelo_varias)
+
+# Realizamos predicciones en test
+lista_predicciones_testing = map(.x = modelos_lineales, .f = augment, newdata = test_data) 
+
+# Obtenemos las métricas de performance en test
+performance_modelos_lineales_test <- map_dfr(.x = lista_predicciones_testing, .f = metrics, truth = price, estimate = .fitted, .id="modelo") %>%
+                                              filter(.metric!="rsq") %>% 
+                                              arrange(.metric, modelo) %>% 
+                                              mutate(.estimate= round(.estimate, digits = 2))
+performance_modelos_lineales_test
+```
+
+### Aplicación de Random Forest
+
+```{r}
+modelo_randomForest <- randomForest(price ~ surface_covered + surface_uncovered + rooms + bathrooms + property_type + l3, data = train_data)
+```
+
+```{r}
+variables_train <- train_data %>% select(surface_covered, surface_uncovered, rooms, bathrooms, property_type,l3)
+variables_test <- test_data %>% select(surface_covered, surface_uncovered, rooms, bathrooms, property_type,l3)
+```
+
+```{r}
+precio_train <- train_data %>% select(price) %>% as.matrix()
+precio_test <- test_data %>% select(price) %>% as.matrix() 
+```
+
+```{r}
+# Agregamos la predicciones al dataset de testeo
+pred_randomForest = predict(modelo_randomForest, variables_test)
+
+```
+
+```{r}
+# Función augment para RF
+augment_RF <- function(modelo_red, matriz_variables, variable_target) {
+  y_pred <- predict(modelo_red, matriz_variables, verbose=0) %>% as.vector()
+  df_predicciones <- tibble(y = as.vector(variable_target), y_pred = y_pred) %>% 
+                      mutate(residuo=y-y_pred)
+  return(df_predicciones)
+}
+```
+
+```{r}
+performance_RF<-augment_RF(modelo_randomForest, variables_test, precio_test) %>%
+  metrics(truth = y, estimate = y_pred) %>% 
+  filter(.metric!="rsq") %>% 
+  arrange(.metric) %>% 
+  mutate(.estimate= round(.estimate, digits = 2))
+performance_RF
+```
+
+### Break down
+
+```{r}
+explain_rf <- DALEX::explain(model = modelo_randomForest,  
+                        data = variables_train,
+                           y = precio_train, 
+                       label = "Random Forest")
+```
+
+###Predict_parts
+
+```{r}
+variable_ya<-filter(variables_test, l3 == "Puerto Madero") 
+
+variable_y<-variable_ya[9,]
+variable_y
+```
+
+
+```{r}
+bd_rf <- predict_parts(explainer = explain_rf,
+                 new_observation = variable_y,
+                            type = "break_down")
+bd_rf 
+```
+
+```{r}
+plot(bd_rf)
+```
+
+#### Cambiar el orden 
+
+```{r}
+bd_rf <- predict_parts(explainer = explain_rf,
+                 new_observation = variable_y,
+                 order = c("surface_uncovered","bathrooms","surface_covered","l3","property_type" , "rooms"),
+                 type = "break_down")
+bd_rf 
+```
+
+```{r}
+plot(bd_rf)
+```
+
+### iBreak down
+
+```{r}
+ibd_rf <- predict_parts(explainer = explain_rf,
+                 new_observation = variable_y,
+                            type = "break_down_interactions")
+ibd_rf 
+```
+
+```{r}
+plot(ibd_rf)
+```
